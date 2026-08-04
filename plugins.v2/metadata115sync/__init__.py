@@ -49,7 +49,7 @@ class Metadata115Sync(_PluginBase):
     plugin_name = "元数据115同步"
     plugin_desc = "将本地硬链接目录已刮削的元数据文件同步到115网盘，避免重复刮削。"
     plugin_icon = "metadata115sync.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "local"
     plugin_label = "媒体整理"
     plugin_config_prefix = "metadata115sync_"
@@ -533,7 +533,10 @@ class Metadata115Sync(_PluginBase):
                     if self._batch_size > 0 and total_uploaded > 0 and total_uploaded % self._batch_size == 0:
                         if self._batch_pause > 0:
                             self._append_log(f"已上传 {total_uploaded} 个文件，暂停 {self._batch_pause} 秒")
-                            time.sleep(self._batch_pause)
+                            self.__interruptible_sleep(self._batch_pause)
+                            if self._stop_flag:
+                                self._append_log("同步已停止")
+                                return total_uploaded, total_skipped, total_failed
                 except Exception as e:
                     logger.error(f"元数据115同步：上传失败 {remote_path}: {e}")
                     total_failed += 1
@@ -567,11 +570,23 @@ class Metadata115Sync(_PluginBase):
                 else:
                     logger.info(f"元数据115同步：接近风控阈值(QPM={qpm}, QPH={qph})，暂停 {self._risk_pause} 秒")
                     self._append_log(f"接近风控阈值(QPM={qpm}, QPH={qph})，暂停 {self._risk_pause} 秒")
-                    time.sleep(self._risk_pause)
+                    self.__interruptible_sleep(self._risk_pause)
+                    if self._stop_flag:
+                        return False
             return True
         except Exception as e:
             logger.error(f"元数据115同步：检测风控阈值失败: {e}")
             return True
+
+    def __interruptible_sleep(self, seconds: int) -> None:
+        """可中断的睡眠，期间检查停止标志。
+
+        :param seconds: 睡眠秒数
+        """
+        for _ in range(int(seconds)):
+            if self._stop_flag:
+                return
+            time.sleep(1)
 
     @staticmethod
     def __is_metadata(path: Path) -> bool:
