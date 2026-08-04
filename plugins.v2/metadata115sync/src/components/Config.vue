@@ -8,7 +8,7 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['save', 'close'])
+const emit = defineEmits(['save', 'switch', 'close'])
 
 const localConfig = ref({
   enabled: false,
@@ -63,6 +63,7 @@ onMounted(() => {
 <template>
   <div class="metadata115sync-config">
     <VToolbar density="comfortable" color="transparent">
+      <VBtn icon="mdi-arrow-left" variant="text" @click="emit('switch')" title="返回主界面" />
       <div class="text-h6 ms-3">元数据115同步配置</div>
       <VSpacer />
       <VBtn icon="mdi-content-save" variant="text" color="primary" @click="saveConfig" />
