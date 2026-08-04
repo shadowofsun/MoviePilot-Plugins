@@ -7,11 +7,14 @@
 避免 MoviePilot 目录监控转移时在115上重复刮削，同时保留元数据。
 
 支持：
-- 手动触发同步（API / 命令）
+- 手动触发同步（API / 命令），支持全部目录或单个目录
+- 后台线程执行，可中途停止
 - 定时同步（cron 或 interval）
 - 目录映射可配置
+- 同步文件信息展示
 """
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -46,7 +49,7 @@ class Metadata115Sync(_PluginBase):
     plugin_name = "元数据115同步"
     plugin_desc = "将本地硬链接目录已刮削的元数据文件同步到115网盘，避免重复刮削。"
     plugin_icon = "metadata115sync.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "local"
     plugin_label = "媒体整理"
     plugin_config_prefix = "metadata115sync_"
@@ -64,6 +67,14 @@ class Metadata115Sync(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _last_run = None
     _last_result = ""
+    # 后台同步线程与停止标志
+    _sync_thread: Optional[threading.Thread] = None
+    _stop_flag = False
+    _running = False
+    _current_dir = ""
+    # 同步文件信息（最近若干条）
+    _sync_log: List[str] = []
+    _log_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
@@ -142,6 +153,13 @@ class Metadata115Sync(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "手动触发指定目录的元数据115同步",
+            },
+            {
+                "path": "/stop",
+                "endpoint": self.api_stop,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "停止正在进行的同步",
             },
             {
                 "path": "/status",
@@ -234,20 +252,34 @@ class Metadata115Sync(_PluginBase):
             "trigger_monitor": self._trigger_monitor,
         }
 
+    def _append_log(self, message: str) -> None:
+        """记录同步文件信息，保留最近若干条。"""
+        with self._log_lock:
+            self._sync_log.append(message)
+            if len(self._sync_log) > 50:
+                self._sync_log = self._sync_log[-50:]
+
     def api_run(self) -> Dict[str, Any]:
-        """API：手动触发全部目录同步。"""
+        """API：手动触发全部目录同步（后台线程）。"""
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
-        self.__sync_all()
-        return {"success": True, "message": "同步完成", "result": self._last_result}
+        if self._running:
+            return {"success": False, "message": "已有同步任务正在进行"}
+        self._stop_flag = False
+        self._running = True
+        self._sync_thread = threading.Thread(target=self.__sync_all, daemon=True)
+        self._sync_thread.start()
+        return {"success": True, "message": "已开始全部目录同步"}
 
     def api_run_dir(self, index: int = 0) -> Dict[str, Any]:
-        """API：手动触发指定目录同步。
+        """API：手动触发指定目录同步（后台线程）。
 
-        :param index: 目录映射索引
+        :param index: 目录映射索引（query 参数）
         """
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
+        if self._running:
+            return {"success": False, "message": "已有同步任务正在进行"}
         if not self._dir_map or index < 0 or index >= len(self._dir_map):
             return {"success": False, "message": f"目录索引无效: {index}"}
         item = self._dir_map[index]
@@ -255,21 +287,33 @@ class Metadata115Sync(_PluginBase):
         remote_base = item.get("remote") or ""
         if not local_base or not remote_base:
             return {"success": False, "message": "目录映射配置不完整"}
-        self._last_run = time.strftime("%Y-%m-%d %H:%M:%S")
-        result = self.__sync_dir(local_base, remote_base)
-        self._last_result = f"[{local_base}] 上传: {result[0]}, 跳过: {result[1]}, 失败: {result[2]}"
-        logger.info(f"元数据115同步（单目录）完成：{self._last_result}")
-        if self._notify:
-            self.post_message(title="元数据115同步", text=self._last_result)
-        return {"success": True, "message": "同步完成", "result": self._last_result}
+        self._stop_flag = False
+        self._running = True
+        self._current_dir = local_base
+        self._sync_thread = threading.Thread(
+            target=self.__sync_dir_thread, args=(local_base, remote_base), daemon=True
+        )
+        self._sync_thread.start()
+        return {"success": True, "message": f"已开始同步目录: {local_base}"}
+
+    def api_stop(self) -> Dict[str, Any]:
+        """API：停止正在进行的同步。"""
+        if not self._running:
+            return {"success": False, "message": "当前没有正在进行的同步"}
+        self._stop_flag = True
+        self._append_log("已请求停止同步，等待当前文件上传完成...")
+        return {"success": True, "message": "已请求停止同步"}
 
     def api_status(self) -> Dict[str, Any]:
         """API：获取同步状态。"""
         return {
             "success": True,
+            "enabled": self._enabled,
+            "running": self._running,
+            "current_dir": self._current_dir,
             "last_run": self._last_run,
             "last_result": self._last_result,
-            "enabled": self._enabled,
+            "sync_log": list(self._sync_log[-20:]),
         }
 
     def api_check(self) -> Dict[str, Any]:
@@ -278,17 +322,14 @@ class Metadata115Sync(_PluginBase):
             from app.modules.filemanager.storages.u115 import U115Pan
 
             u115 = U115Pan()
-            # 读取风控冷却状态
             limit_until = getattr(u115, "_limit_until", 0.0)
             now = time.time()
             in_cooldown = limit_until > now
             cooldown_remaining = max(0, int(limit_until - now)) if in_cooldown else 0
-            # 读取速率统计
             rate_stats = getattr(u115, "_rate_stats", None)
             qps = rate_stats.get_qps() if rate_stats else 0
             qpm = rate_stats.get_qpm() if rate_stats else 0
             qph = rate_stats.get_qph() if rate_stats else 0
-            # 读取限流器
             api_limiter = getattr(u115, "_api_limiter", None)
             download_limiter = getattr(u115, "_download_limiter", None)
             api_qps = getattr(api_limiter, "qps", None) if api_limiter else None
@@ -326,34 +367,67 @@ class Metadata115Sync(_PluginBase):
         """监听整理完成事件，自动触发元数据同步。"""
         if not self._enabled or not self._trigger_monitor:
             return
+        if self._running:
+            return
         logger.info("元数据115同步：检测到整理完成事件，触发同步")
-        self.__sync_all()
+        self._stop_flag = False
+        self._running = True
+        self._sync_thread = threading.Thread(target=self.__sync_all, daemon=True)
+        self._sync_thread.start()
 
     def __sync_all(self) -> None:
-        """执行所有目录的元数据同步。"""
+        """后台线程：执行所有目录的元数据同步。"""
         self._last_run = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._current_dir = "全部目录"
         if not self._dir_map:
             self._last_result = "未配置目录映射"
             logger.warn("元数据115同步：未配置目录映射")
+            self._running = False
             return
 
         total_uploaded = 0
         total_skipped = 0
         total_failed = 0
-        for item in self._dir_map:
-            local_base = item.get("local") or ""
-            remote_base = item.get("remote") or ""
-            if not local_base or not remote_base:
-                continue
-            result = self.__sync_dir(local_base, remote_base)
-            total_uploaded += result[0]
-            total_skipped += result[1]
-            total_failed += result[2]
+        try:
+            for item in self._dir_map:
+                if self._stop_flag:
+                    self._append_log("同步已停止")
+                    break
+                local_base = item.get("local") or ""
+                remote_base = item.get("remote") or ""
+                if not local_base or not remote_base:
+                    continue
+                self._current_dir = local_base
+                result = self.__sync_dir(local_base, remote_base)
+                total_uploaded += result[0]
+                total_skipped += result[1]
+                total_failed += result[2]
+                if self._stop_flag:
+                    self._append_log("同步已停止")
+                    break
 
-        self._last_result = f"上传: {total_uploaded}, 跳过(已存在): {total_skipped}, 失败: {total_failed}"
-        logger.info(f"元数据115同步完成：{self._last_result}")
-        if self._notify:
-            self.post_message(title="元数据115同步", text=self._last_result)
+            self._last_result = f"上传: {total_uploaded}, 跳过(已存在): {total_skipped}, 失败: {total_failed}"
+            logger.info(f"元数据115同步完成：{self._last_result}")
+            self._append_log(f"同步完成：{self._last_result}")
+            if self._notify:
+                self.post_message(title="元数据115同步", text=self._last_result)
+        finally:
+            self._running = False
+            self._current_dir = ""
+
+    def __sync_dir_thread(self, local_base: str, remote_base: str) -> None:
+        """后台线程：同步单个目录。"""
+        self._last_run = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            result = self.__sync_dir(local_base, remote_base)
+            self._last_result = f"[{local_base}] 上传: {result[0]}, 跳过: {result[1]}, 失败: {result[2]}"
+            logger.info(f"元数据115同步（单目录）完成：{self._last_result}")
+            self._append_log(f"同步完成：{self._last_result}")
+            if self._notify:
+                self.post_message(title="元数据115同步", text=self._last_result)
+        finally:
+            self._running = False
+            self._current_dir = ""
 
     def __sync_dir(self, local_base: str, remote_base: str) -> Tuple[int, int, int]:
         """同步单个目录的元数据文件到115。
@@ -380,18 +454,31 @@ class Metadata115Sync(_PluginBase):
         u115.set_config(storage.config)
 
         logger.info(f"元数据115同步：处理 {local_base} -> {remote_base}")
+        self._append_log(f"开始同步：{local_base}")
+        # 检查风控，风控中则直接停止（不阻塞等待）
+        if self.__is_risk_cooldown(u115):
+            self._append_log("115风控冷却中，同步暂停")
+            return 0, 0, 0
         # 列出115已存在文件
         remote_files = self.__list_remote_files(u115, remote_base)
+        self._append_log(f"115已存在文件数: {len(remote_files)}")
         total_uploaded = 0
         total_skipped = 0
         total_failed = 0
         # 遍历本地元数据文件
         for root, dirs, files in __import__("os").walk(local_base_path):
+            if self._stop_flag:
+                self._append_log("同步已停止")
+                break
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("@eaDir", "@Recycle", "#recycle")]
             for fname in files:
+                if self._stop_flag:
+                    self._append_log("同步已停止")
+                    break
                 # 检测115风控，风控中则停止同步
-                if getattr(u115, "_limit_until", 0) and time.time() < u115._limit_until:
+                if self.__is_risk_cooldown(u115):
                     logger.warn(f"元数据115同步：115风控冷却中，停止同步 {local_base}")
+                    self._append_log("115风控冷却中，同步暂停")
                     return total_uploaded, total_skipped, total_failed
                 local_file = Path(root) / fname
                 if not self.__is_metadata(local_file):
@@ -409,15 +496,24 @@ class Metadata115Sync(_PluginBase):
                     new_item = u115.upload(target_dir, local_file)
                     if new_item:
                         total_uploaded += 1
+                        self._append_log(f"上传: {remote_path}")
                     else:
                         total_failed += 1
+                        self._append_log(f"失败: {remote_path}")
                     # 上传间隔，避免触发115风控
                     if self._upload_delay > 0:
                         time.sleep(self._upload_delay)
                 except Exception as e:
                     logger.error(f"元数据115同步：上传失败 {remote_path}: {e}")
                     total_failed += 1
+                    self._append_log(f"错误: {remote_path}")
         return total_uploaded, total_skipped, total_failed
+
+    @staticmethod
+    def __is_risk_cooldown(u115) -> bool:
+        """判断115是否处于风控冷却中。"""
+        limit_until = getattr(u115, "_limit_until", 0)
+        return bool(limit_until) and time.time() < limit_until
 
     @staticmethod
     def __is_metadata(path: Path) -> bool:
@@ -427,14 +523,15 @@ class Metadata115Sync(_PluginBase):
             return False
         return ext in _META_EXTS
 
-    @staticmethod
-    def __list_remote_files(u115, remote_base: str, max_depth: int = 6) -> set:
-        """递归列出115目录下所有文件路径。"""
+    def __list_remote_files(self, u115, remote_base: str, max_depth: int = 6) -> set:
+        """递归列出115目录下所有文件路径，支持停止标志检查。"""
         from app import schemas
         result = set()
 
         def _walk(fileitem, depth):
             if depth > max_depth:
+                return
+            if self._stop_flag:
                 return
             try:
                 items = u115.list(fileitem)
@@ -442,6 +539,8 @@ class Metadata115Sync(_PluginBase):
                 logger.error(f"元数据115同步：列出 {fileitem.path} 失败: {e}")
                 return
             for it in items:
+                if self._stop_flag:
+                    return
                 if it.type == "dir":
                     _walk(it, depth + 1)
                 else:
