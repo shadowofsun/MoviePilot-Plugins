@@ -49,7 +49,7 @@ class Metadata115Sync(_PluginBase):
     plugin_name = "元数据115同步"
     plugin_desc = "将本地硬链接目录已刮削的元数据文件同步到115网盘，避免重复刮削。"
     plugin_icon = "metadata115sync.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "local"
     plugin_label = "媒体整理"
     plugin_config_prefix = "metadata115sync_"
@@ -64,6 +64,12 @@ class Metadata115Sync(_PluginBase):
     _dir_map = []
     _upload_delay = 0.5
     _trigger_monitor = False
+    # 批量暂停配置
+    _batch_size = 50
+    _batch_pause = 10
+    # 风控处理配置
+    _risk_action = "pause"
+    _risk_pause = 60
     _scheduler: Optional[BackgroundScheduler] = None
     _last_run = None
     _last_result = ""
@@ -87,6 +93,10 @@ class Metadata115Sync(_PluginBase):
         self._dir_map = []
         self._upload_delay = 0.5
         self._trigger_monitor = False
+        self._batch_size = 50
+        self._batch_pause = 10
+        self._risk_action = "pause"
+        self._risk_pause = 60
         if not config:
             return
         self._enabled = bool(config.get("enabled"))
@@ -97,6 +107,10 @@ class Metadata115Sync(_PluginBase):
         self._dir_map = config.get("dir_map") or []
         self._upload_delay = float(config.get("upload_delay") or 0.5)
         self._trigger_monitor = bool(config.get("trigger_monitor"))
+        self._batch_size = int(config.get("batch_size") or 50)
+        self._batch_pause = int(config.get("batch_pause") or 10)
+        self._risk_action = str(config.get("risk_action") or "pause")
+        self._risk_pause = int(config.get("risk_pause") or 60)
 
         # 立即运行一次
         if self._onlyonce:
@@ -117,6 +131,10 @@ class Metadata115Sync(_PluginBase):
                 "dir_map": self._dir_map,
                 "upload_delay": self._upload_delay,
                 "trigger_monitor": self._trigger_monitor,
+                "batch_size": self._batch_size,
+                "batch_pause": self._batch_pause,
+                "risk_action": self._risk_action,
+                "risk_pause": self._risk_pause,
             })
             if self._scheduler.get_jobs():
                 self._scheduler.start()
@@ -250,6 +268,10 @@ class Metadata115Sync(_PluginBase):
             "dir_map": self._dir_map,
             "upload_delay": self._upload_delay,
             "trigger_monitor": self._trigger_monitor,
+            "batch_size": self._batch_size,
+            "batch_pause": self._batch_pause,
+            "risk_action": self._risk_action,
+            "risk_pause": self._risk_pause,
         }
 
     def _append_log(self, message: str) -> None:
@@ -480,6 +502,10 @@ class Metadata115Sync(_PluginBase):
                     logger.warn(f"元数据115同步：115风控冷却中，停止同步 {local_base}")
                     self._append_log("115风控冷却中，同步暂停")
                     return total_uploaded, total_skipped, total_failed
+                # 检测风控阈值，按配置处理
+                if not self.__handle_risk(u115):
+                    self._append_log("同步已停止（风控阈值）")
+                    return total_uploaded, total_skipped, total_failed
                 local_file = Path(root) / fname
                 if not self.__is_metadata(local_file):
                     continue
@@ -503,6 +529,11 @@ class Metadata115Sync(_PluginBase):
                     # 上传间隔，避免触发115风控
                     if self._upload_delay > 0:
                         time.sleep(self._upload_delay)
+                    # 批量暂停：每上传 batch_size 个文件后暂停 batch_pause 秒
+                    if self._batch_size > 0 and total_uploaded > 0 and total_uploaded % self._batch_size == 0:
+                        if self._batch_pause > 0:
+                            self._append_log(f"已上传 {total_uploaded} 个文件，暂停 {self._batch_pause} 秒")
+                            time.sleep(self._batch_pause)
                 except Exception as e:
                     logger.error(f"元数据115同步：上传失败 {remote_path}: {e}")
                     total_failed += 1
@@ -514,6 +545,33 @@ class Metadata115Sync(_PluginBase):
         """判断115是否处于风控冷却中。"""
         limit_until = getattr(u115, "_limit_until", 0)
         return bool(limit_until) and time.time() < limit_until
+
+    def __handle_risk(self, u115) -> bool:
+        """检测115风控阈值，按配置处理（停止或暂停）。
+
+        :param u115: 115存储操作对象
+        :return: True 继续同步，False 停止同步
+        """
+        try:
+            rate_stats = getattr(u115, "_rate_stats", None)
+            if not rate_stats:
+                return True
+            qpm = rate_stats.get_qpm()
+            qph = rate_stats.get_qph()
+            # 接近风控阈值（QPM>=80 或 QPH>=1500）
+            if qpm >= 80 or qph >= 1500:
+                if self._risk_action == "stop":
+                    logger.warn(f"元数据115同步：接近风控阈值(QPM={qpm}, QPH={qph})，按配置停止")
+                    self._append_log(f"接近风控阈值(QPM={qpm}, QPH={qph})，已停止")
+                    return False
+                else:
+                    logger.info(f"元数据115同步：接近风控阈值(QPM={qpm}, QPH={qph})，暂停 {self._risk_pause} 秒")
+                    self._append_log(f"接近风控阈值(QPM={qpm}, QPH={qph})，暂停 {self._risk_pause} 秒")
+                    time.sleep(self._risk_pause)
+            return True
+        except Exception as e:
+            logger.error(f"元数据115同步：检测风控阈值失败: {e}")
+            return True
 
     @staticmethod
     def __is_metadata(path: Path) -> bool:
