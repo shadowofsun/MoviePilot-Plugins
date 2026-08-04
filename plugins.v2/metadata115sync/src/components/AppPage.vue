@@ -16,15 +16,21 @@ const props = defineProps({
   },
 })
 
+const emit = defineEmits(['open-config'])
+
 const loading = ref(false)
 const runningAll = ref(false)
 const runningIndex = ref(-1)
 const checking = ref(false)
+const stopping = ref(false)
 const error = ref('')
 const status = ref({
   enabled: false,
+  running: false,
+  current_dir: '',
   last_run: '',
   last_result: '',
+  sync_log: [],
 })
 const dirMap = ref([])
 const checkResult = ref(null)
@@ -40,8 +46,11 @@ async function loadStatus() {
     const data = response?.data || response || {}
     status.value = {
       enabled: Boolean(data.enabled),
+      running: Boolean(data.running),
+      current_dir: data.current_dir || '',
       last_run: data.last_run || '',
       last_result: data.last_result || '',
+      sync_log: Array.isArray(data.sync_log) ? data.sync_log : [],
     }
     // 加载目录映射配置
     const cfgResp = await props.api.get(`${pluginBase.value}`)
@@ -65,8 +74,8 @@ async function runSyncAll() {
     if (data.success === false) {
       error.value = data.message || '同步失败'
     } else {
-      status.value.last_result = data.result || data.message || '同步完成'
-      status.value.last_run = new Date().toLocaleString()
+      status.value.running = true
+      status.value.current_dir = '全部目录'
     }
   } catch (err) {
     error.value = err?.message || '同步失败'
@@ -75,23 +84,40 @@ async function runSyncAll() {
   }
 }
 
-// 手动触发指定目录同步。
+// 手动触发指定目录同步（用 query 参数传 index）。
 async function runSyncDir(index) {
   runningIndex.value = index
   error.value = ''
   try {
-    const response = await props.api.post(`${pluginBase.value}/run_dir`, { index })
+    const response = await props.api.post(`${pluginBase.value}/run_dir?index=${index}`)
     const data = response?.data || response || {}
     if (data.success === false) {
       error.value = data.message || '同步失败'
     } else {
-      status.value.last_result = data.result || data.message || '同步完成'
-      status.value.last_run = new Date().toLocaleString()
+      status.value.running = true
+      status.value.current_dir = data.message || ''
     }
   } catch (err) {
     error.value = err?.message || '同步失败'
   } finally {
     runningIndex.value = -1
+  }
+}
+
+// 停止同步。
+async function stopSync() {
+  stopping.value = true
+  error.value = ''
+  try {
+    const response = await props.api.post(`${pluginBase.value}/stop`)
+    const data = response?.data || response || {}
+    if (data.success === false) {
+      error.value = data.message || '停止失败'
+    }
+  } catch (err) {
+    error.value = err?.message || '停止失败'
+  } finally {
+    stopping.value = false
   }
 }
 
@@ -126,6 +152,12 @@ function formatCooldown(seconds) {
 
 onMounted(() => {
   loadStatus()
+  // 定时刷新状态（同步进行中时）
+  setInterval(() => {
+    if (status.value.running) {
+      loadStatus()
+    }
+  }, 3000)
 })
 </script>
 
@@ -135,6 +167,16 @@ onMounted(() => {
       <VCardTitle class="d-flex align-center">
         <VIcon class="me-2" color="primary">mdi-cloud-upload</VIcon>
         元数据115同步
+        <VSpacer />
+        <VBtn
+          size="small"
+          variant="tonal"
+          color="primary"
+          prepend-icon="mdi-cog"
+          @click="emit('open-config')"
+        >
+          设置
+        </VBtn>
       </VCardTitle>
     </VCard>
 
@@ -152,6 +194,15 @@ onMounted(() => {
               <VChip :color="status.enabled ? 'success' : 'default'" size="small">
                 {{ status.enabled ? '已启用' : '未启用' }}
               </VChip>
+              <VChip v-if="status.running" color="primary" size="small" class="ms-2">
+                同步中
+              </VChip>
+            </VListItemTitle>
+          </VListItem>
+          <VListItem v-if="status.running">
+            <VListItemTitle>
+              <span class="text-body-2">当前目录：</span>
+              <span>{{ status.current_dir || '...' }}</span>
             </VListItemTitle>
           </VListItem>
           <VListItem>
@@ -172,11 +223,20 @@ onMounted(() => {
         <VBtn
           color="primary"
           :loading="runningAll"
-          :disabled="!status.enabled"
+          :disabled="!status.enabled || status.running"
           prepend-icon="mdi-play"
           @click="runSyncAll"
         >
           全部同步
+        </VBtn>
+        <VBtn
+          v-if="status.running"
+          color="error"
+          :loading="stopping"
+          prepend-icon="mdi-stop"
+          @click="stopSync"
+        >
+          停止
         </VBtn>
         <VBtn
           color="warning"
@@ -235,6 +295,19 @@ onMounted(() => {
       </VCardText>
     </VCard>
 
+    <VCard v-if="status.sync_log.length" class="mb-4">
+      <VCardTitle>同步记录</VCardTitle>
+      <VCardText>
+        <VList density="compact" max-height="200" class="overflow-y-auto">
+          <VListItem v-for="(log, idx) in status.sync_log" :key="idx">
+            <VListItemTitle>
+              <span class="text-caption">{{ log }}</span>
+            </VListItemTitle>
+          </VListItem>
+        </VList>
+      </VCardText>
+    </VCard>
+
     <VCard>
       <VCardTitle>目录映射</VCardTitle>
       <VCardText>
@@ -262,7 +335,7 @@ onMounted(() => {
                     size="small"
                     variant="tonal"
                     :loading="runningIndex === index"
-                    :disabled="!status.enabled || runningAll"
+                    :disabled="!status.enabled || status.running"
                     prepend-icon="mdi-play"
                     @click="runSyncDir(index)"
                   >
