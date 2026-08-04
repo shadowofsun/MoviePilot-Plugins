@@ -18,6 +18,10 @@ const localConfig = ref({
   notify: false,
   upload_delay: 0.5,
   trigger_monitor: false,
+  batch_size: 50,
+  batch_pause: 10,
+  risk_action: 'pause',
+  risk_pause: 60,
   dir_map: [],
 })
 
@@ -40,6 +44,11 @@ function saveConfig() {
     onlyonce: Boolean(localConfig.value.onlyonce),
     notify: Boolean(localConfig.value.notify),
     upload_delay: Number(localConfig.value.upload_delay) || 0,
+    trigger_monitor: Boolean(localConfig.value.trigger_monitor),
+    batch_size: Number(localConfig.value.batch_size) || 0,
+    batch_pause: Number(localConfig.value.batch_pause) || 0,
+    risk_action: localConfig.value.risk_action || 'pause',
+    risk_pause: Number(localConfig.value.risk_pause) || 0,
     dir_map: (localConfig.value.dir_map || []).filter(
       item => item.local && item.remote
     ),
@@ -55,6 +64,11 @@ onMounted(() => {
     onlyonce: Boolean(cfg.onlyonce),
     notify: Boolean(cfg.notify),
     upload_delay: Number(cfg.upload_delay) || 0.5,
+    trigger_monitor: Boolean(cfg.trigger_monitor),
+    batch_size: Number(cfg.batch_size) || 50,
+    batch_pause: Number(cfg.batch_pause) || 10,
+    risk_action: cfg.risk_action || 'pause',
+    risk_pause: Number(cfg.risk_pause) || 60,
     dir_map: Array.isArray(cfg.dir_map) ? cfg.dir_map.map(item => ({ ...item })) : [],
   }
 })
@@ -114,6 +128,54 @@ onMounted(() => {
             step="0.1"
             hint="每个文件上传后的等待间隔，避免触发115风控。建议 0.5-2 秒"
           />
+        </VCardText>
+      </VCard>
+
+      <VCard class="mb-4">
+        <VCardTitle>风控保护</VCardTitle>
+        <VCardText>
+          <VRow>
+            <VCol cols="12" md="6">
+              <VTextField
+                v-model.number="localConfig.batch_size"
+                label="每上传多少个文件后暂停"
+                type="number"
+                min="0"
+                hint="每上传 N 个文件后暂停一次，0 表示不启用"
+              />
+            </VCol>
+            <VCol cols="12" md="6">
+              <VTextField
+                v-model.number="localConfig.batch_pause"
+                label="批量暂停时长（秒）"
+                type="number"
+                min="0"
+                hint="达到批量数量后暂停的秒数"
+              />
+            </VCol>
+          </VRow>
+          <VRow>
+            <VCol cols="12" md="6">
+              <VSelect
+                v-model="localConfig.risk_action"
+                label="接近风控阈值时"
+                :items="[
+                  { title: '暂停一段时间', value: 'pause' },
+                  { title: '停止同步', value: 'stop' },
+                ]"
+                hint="检测到接近115风控阈值时的处理方式"
+              />
+            </VCol>
+            <VCol cols="12" md="6">
+              <VTextField
+                v-model.number="localConfig.risk_pause"
+                label="风控暂停时长（秒）"
+                type="number"
+                min="0"
+                hint="选择「暂停一段时间」时生效"
+              />
+            </VCol>
+          </VRow>
         </VCardText>
       </VCard>
 
